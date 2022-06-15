@@ -51,6 +51,10 @@ NEW:
 ```
 pip install --upgrade pip
 pip install "jax[tpu]==0.3.2" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+python3
+import jax
+jax.device_count()
+exit()
 export LD_LIBRARY_PATH=/usr/local/lib
 ldd /usr/local/lib/python3.8/dist-packages/torch/lib/libtorch.so
 ```
