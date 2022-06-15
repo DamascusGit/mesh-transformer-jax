@@ -1,400 +1,85 @@
-import argparse
-import json
-import time
-
-import jax
-import numpy as np
-import optax
-
-import wandb
-from tqdm import tqdm
-
-
-from mesh_transformer import util
-from mesh_transformer.checkpoint import read_ckpt, write_ckpt
-from mesh_transformer.transformer_shard import CausalTransformer
-from tfrecord_loader import TFRecordNewInputs
-from smart_open import open
-from google.cloud import storage
-from google.cloud.exceptions import NotFound
-
-from mesh_transformer.util import clip_by_global_norm, additive_weight_decay
-
-
-def parse_args():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="""
-    To use, download the full checkpoint archive, extract and upload to a GCS bucket, and set that as --tune-model-path
-    Modify the config file:
-        - set `model_dir` to where the checkpoints should be written during training
-        - set `train_set`, `val_set` to index files for your data
-        - set `tpu_size` to 8 (if on a v3-8)
-        - set `warmup_steps`, `anneal_steps`, `lr`, `end_lr` to the lr schedule for your finetuning run
-        - the global step will reset to 0, keep that in mind when writing your lr schedule
-        - set `name` to specify the name of the Weights & Biases run
-        - set `wandb_project` to specify the Weights & Biases project to log to
-    To prepare data in the expected data format:
-        - use the script `create_finetune_tfrecords.py` in this repo to create data in the expected format
-        - upload the .tfrecords files to GCS
-        - save their GCS paths to a index file under `data/`, see existing files for examples
-    """,
-    formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--config", type=str, default=None, help="Config file location")
-    parser.add_argument("--tune-model-path", type=str, default=None, help="Base model to finetune")
-    parser.add_argument("--fresh-opt", default=False, action="store_true", help="Use a newly initialized optimizer, ignoring any optimizer state saved in the base checkpoint")
-
-    args = parser.parse_args()
-    return args
-
-
-def save(network, step, bucket, path, mp, aux=None, keep_n=3, delete_old=True):
-    assert path
-    client = storage.Client()
-
-    if aux is None:
-        aux = {}
-
-    try:
-        with open(f"gs://{bucket}/{path}/meta.json", "r") as f:
-            meta = json.load(f)
-    except:
-        # create metadata file
-        with open(f"gs://{bucket}/{path}/meta.json", "w") as f:
-            json.dump({
-                "step": 0,
-                "checkpoints": [],
-                "aux": {}
-            }, f)
-
-    # do sharded checkpoint writing
-    start = time.time()
-    res = []
-    for shard_id in range(mp):
-        write_ckpt(network.state, f"gs://{bucket}/{path}/step_{step}/", shard_id)
-
-    print(f"Wrote checkpoint in {time.time() - start:.06}s")
-
-    with open(f"gs://{bucket}/{path}/meta.json", "r") as f:
-        meta = json.load(f)
-
-    meta["step"] = step
-    meta["checkpoints"].append(step)
-    all_aux = meta.get("aux", {})
-
-    while len(meta["checkpoints"]) > keep_n:
-        ckpt_to_delete = meta["checkpoints"].pop(0)
-
-        try:
-            del all_aux[str(ckpt_to_delete)]
-        except:
-            print(f"failed to delete the aux state for {step}")
-
-        if delete_old:
-            print(f"deleting checkpoint {ckpt_to_delete}")
-            for blob in client.list_blobs(bucket, prefix=f"{path}/step_{ckpt_to_delete}/"):
-                # print(f"deleting {blob.name}")
-                assert path in blob.name
-                blob.delete()
-        else:
-            print(f"keeping checkpoint {ckpt_to_delete}")
-
-    all_aux[step] = aux
-    meta["aux"] = all_aux
-
-    with open(f"gs://{bucket}/{path}/meta.json", "w") as f:
-        json.dump(meta, f)
-
-
-def train_step(network, data):
-    inputs = {
-        "obs": data[:, :, :-1],
-        "target": data[:, :, 1:],
-    }
-
-    loss, last_loss, grad_norm, grad_norm_micro = network.train(inputs)
-
-    return (
-        np.array(loss).mean(),
-        np.array(last_loss).mean(),
-        np.array(grad_norm).mean(),
-        np.array(grad_norm_micro).mean(),
-    )
-
-
-def eval_step(network, data):
-    inputs = {
-        "obs": data[:, :-1],
-        "target": data[:, 1:],
-    }
-
-    out = network.eval(inputs)
-    loss = out["loss"]
-
-    return np.array(loss).mean()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    params = json.load(open(args.config))
-
-    gradient_accumulation_steps = params.get("gradient_accumulation_steps", 1)
-    per_replica_batch = params["per_replica_batch"]
-    cores_per_replica = params["cores_per_replica"]
-
-    assert cores_per_replica <= 8
-
-    bucket = params["bucket"]
-    model_dir = params["model_dir"]
-    layers = params["layers"]
-    d_model = params["d_model"]
-    n_heads = params["n_heads"]
-    n_vocab = params["n_vocab"]
-    seq = params["seq"]
-    norm = params["norm"]
-
-    val_batches = params["val_batches"]
-    val_every = params["val_every"]
-    ckpt_every = params["ckpt_every"]
-    keep_every = params["keep_every"]
-    eval_tasks = params["eval_harness_tasks"]
-    total_steps = params["total_steps"]
-
-    pe = params["pe"]
-    assert pe in ["fixed", "rotary", "t5"]
-
-    warmup_steps = params["warmup_steps"]
-    anneal_steps = params["anneal_steps"]
-    lr = params["lr"]
-    end_lr = params["end_lr"]
-    weight_decay = params["weight_decay"]
-   
-    # alpha parameter for the exponential moving averages used to compute B_simple
-    noise_scale_alpha = params.get("noise_scale_alpha", 0.01)
-
-    scheduler = util.gpt3_schedule(warmup_steps, anneal_steps, lr, end_lr)
-    
-    opt = optax.chain(
-        optax.scale(1 / gradient_accumulation_steps),
-        clip_by_global_norm(1),
-        optax.scale_by_adam(),
-        additive_weight_decay(weight_decay),
-        optax.scale(-1),
-        optax.scale_by_schedule(scheduler)
-    )
-
-    params["optimizer"] = opt
-
-    start = time.time()
-    tpu_size = jax.device_count()
-    if tpu_size < cores_per_replica:
-        msg = f"each shard needs a separate device, but device count ({tpu_size}) < shard count ({cores_per_replica})"
-        raise ValueError(msg)
-    print(f"jax devices: {tpu_size}")
-    print(f"jax runtime initialized in {time.time() - start:.06}s")
-
-    mesh_shape = (tpu_size // cores_per_replica, cores_per_replica)
-    devices = np.array(jax.devices()).reshape(mesh_shape)
-
-    # pick initial ckpt - based on tuning vs train from scratch
-
-    step = 0
-    initial_ckpt_state_path = None
-    train_loader = None
-
-    if args.tune_model_path:
-        print('`--tune_model_path` passed: we are beginning a fine-tuning run')
-        fine_tuning = True
-        initial_ckpt_state_path = args.tune_model_path
-    else:
-        print('`--tune_model_path` not passed: we are continuing a fine-tuning run from a checkpoint (or we are not fine-tuning)')
-        fine_tuning = False
-        initial_ckpt_model_dir = model_dir
-        initial_ckpt_path = f"gs://{bucket}/{initial_ckpt_model_dir}"
-        meta_path = f"{initial_ckpt_path}/meta.json"
-
-        try:
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-            ckpt_step = meta["checkpoints"][-1]
-            initial_ckpt_state_path = f"{initial_ckpt_path}/step_{ckpt_step}/"
-            print(f"state will be restored from checkpoint {ckpt_step}")
-
-            step = ckpt_step
-            train_loader = meta['aux'][str(ckpt_step)].get("train_loader", None)
-        except NotFound:
-            # no checkpoint, start at zero
-            print(f"No checkpoint to load at {initial_ckpt_path}. Training from scratch.")
-
-    if initial_ckpt_state_path:
-        print(f"path to load checkpoint from: {initial_ckpt_state_path}")
-    else:
-        print("not loading from a checkpoint")
-
-    # set up datasets
-    print("setting up datasets")
-
-    train_dataset = TFRecordNewInputs(f"data/{params['train_set']}",
-                                      batch_size=(
-                                          gradient_accumulation_steps,
-                                          per_replica_batch * tpu_size // cores_per_replica),
-                                      sample_size=params['seq'],
-                                      restore_state=train_loader)
-
-    global_val_batch = per_replica_batch * tpu_size // cores_per_replica
-
-    val_sets = {}
-
-    for k, v in params["val_set"].items():
-        val_sets[k] = TFRecordNewInputs(
-            f"data/{v}", batch_size=(global_val_batch,), sample_size=seq
-        )
-
-    # tok/sec metrics
-    sequences_per_step = gradient_accumulation_steps * (per_replica_batch * tpu_size // cores_per_replica)
-    tokens_per_step = params['seq'] * sequences_per_step
-
-    # load + run
-    with jax.experimental.maps.mesh(devices, ('dp', 'mp')):
-        print("initializing network")
-        network = CausalTransformer(params)
-
-        if initial_ckpt_state_path:
-            print("loading network")
-            if fine_tuning:
-                # get the scheduler step stored in the just-initialized optimizer
-                # should be zero
-                init_sched_state = network.state["opt_state"][-1]
-
-            start = time.time()
-            network.state = read_ckpt(network.state, initial_ckpt_state_path, devices.shape[1], load_opt=(not args.fresh_opt))
-            network.state["opt_state"]= list(network.state["opt_state"])
-
-            if fine_tuning:
-                # overwrite the loaded scheduler step with zeros
-                # this makes fine-tuning use the lr schedule in
-                network.state["opt_state"][-1] = init_sched_state
-
-            print(f"network loaded in {time.time() - start:.06}s")
-
-        print('compiling train fn')
-        start = time.time()
-        loss, last_loss, grad_norm, grad_norm_micro = train_step(
-            network, train_dataset.get_samples()
-        )
-        step += 1
-        print(f"Train fn compiled in {time.time() - start:.06}s")
-
-        print('compiling eval fn')
-        start = time.time()
-        for val_set in val_sets.values():
-            eval_step(network, val_set.get_samples())
-            val_set.reset()
-        print(f"Eval fn compiled in {time.time() - start:.06}s")
-
-        project = params.get("wandb_project", "mesh-transformer-jax")
-        wandb.init(project=project, name=params["name"], config=params)
-
-        G_noise_avg = None
-        S_noise_avg = None
-
-        while True:
-            if (step % ckpt_every == 1) or step == total_steps:
-                print(f"saving a checkpoint for step {step}")
-                save(network, step, bucket, model_dir,
-                     mp=cores_per_replica,
-                     aux={"train_loader": train_dataset.get_state()},
-                     delete_old=True,
-                     )
-
-            if step % val_every == 1:  # 1 because we've already taken a step to compile train fn
-                for name, val_set in val_sets.items():
-                    val_loss = []
-                    for i, _ in tqdm(zip(val_set.sample_once(), range(val_batches)),
-                                     desc=f"validation for step {step}, set {name}",
-                                     total=val_batches):
-                        val_loss.append(eval_step(network, i))
-                    val_set.reset()
-
-                    val_loss = np.array(val_loss).mean()
-                    print(f"validation loss for step {step}, set {name}: {val_loss}")
-
-                    wandb.log({f'val/loss_{name}': float(val_loss)}, step)
-
-            if step == total_steps:
-                print("training completed!")
-                exit()
-
-            start = time.time()
-            loss, last_loss, grad_norm, grad_norm_micro = train_step(
-                network, train_dataset.get_samples()
-            )
-            step += 1
-
-            steps_per_sec = 1 / (time.time() - start)
-            tokens_per_sec = tokens_per_step * steps_per_sec
-            sequences_processed = sequences_per_step * step
-            tokens_processed = tokens_per_step * step
-
-            ### compute summary stats about the gradient
-
-            # converts from grads-summed-over-microbatch (what `CasualTransformer.train` computes)
-            # to grads-averaged-over-microbatch (what we want)
-            #
-            # (when taking gradient steps, the same conversion happens inside the optimizer
-            #  via optax.scale(1 / gradient_accumulation_steps))
-            grad_norm = grad_norm / gradient_accumulation_steps
-
-            # compute G_noise and S_noise
-            # from "An Empirical Model of Large-Batch Training" Appendix A.1
-            # here, B_big = gradient_accumulation_steps, and B_small = 1 for convenience
-            gbsmall = grad_norm_micro ** 2
-            gbbig = grad_norm ** 2
-            G_noise = (gradient_accumulation_steps * gbbig - gbsmall) / (
-                gradient_accumulation_steps - 1
-            )
-            S_noise = (gbsmall - gbbig) / (1 - 1 / gradient_accumulation_steps)
-
-            noise_scale_stats = {
-                "noise/G_noise": G_noise,
-                "noise/S_noise": S_noise,
-            }
-
-            # heuristic to avoid reporting G_noise in very early training when gradients are large
-            # (these take a long time to wash out of the moving average that defines B_simple)
-            use_step_in_noise_avgs = gbbig < 2
-
-            if use_step_in_noise_avgs:
-                # compute moving averages of G_noise and S_noise, for B_simple
-                if G_noise_avg is None:
-                    G_noise_avg = G_noise
-                else:
-                    G_noise_avg = (1 - noise_scale_alpha) * G_noise_avg + noise_scale_alpha * G_noise
-
-                if S_noise_avg is None:
-                    S_noise_avg = S_noise
-                else:
-                    S_noise_avg = (1 - noise_scale_alpha) * S_noise_avg + noise_scale_alpha * S_noise
-
-                B_simple = S_noise_avg / G_noise_avg
-
-                noise_scale_stats.update(
-                    {
-                        "noise/G_noise_avg": G_noise_avg,
-                        "noise/S_noise_avg": S_noise_avg,
-                        "noise/B_simple": B_simple,
-                    }
-                )
-
-            wandb_stats = {
-                "train/loss": loss,
-                "train/last_loss": last_loss,
-                "train/steps_per_sec": steps_per_sec,
-                "train/tokens_per_sec": tokens_per_sec,
-                "train/grad_norm": grad_norm,
-                "train/learning_rate": float(scheduler(network.state["opt_state"][-1].count[0].item())),
-                "sequences_processed": sequences_processed,
-                "tokens_processed": tokens_processed,
-            }
-            wandb_stats.update(noise_scale_stats)
-
-            wandb.log(wandb_stats, step)
+# How to Fine-Tune GPT-J - The Basics
+
+Before anything else, you'll likely want to apply for access to the TPU Research Cloud (TRC). Combined with a Google Cloud free trial, that should allow you to do everything here for free. Once you're in TRC, you need to create a project, then with the name of the new project fill out the form that was emailed to you. Use the script `create_finetune_tfrecords.py` to prepare your data as tfrecords; I might do a separate guide on that. Another thing you might want to do is fork the mesh-transformer-jax repo to make it easier to add and modify the config files.
+
+0. [Install the Google Cloud SDK](https://cloud.google.com/sdk/docs/install). We'll need it later.
+
+1. If you didn't make a project and activate TPU access through TRC yet (or if you plan on paying out of pocket), [make one now](https://console.cloud.google.com/projectcreate).
+
+2. TPUs use Google Cloud buckets for storage, go ahead and [create one now](https://console.cloud.google.com/storage/create-bucket). Make sure it's in the region the TPU VM will be; the email from TRC will tell you which region(s) you can use free TPUs in.
+
+3. You'll need the full pretrained weights in order to fine-tune the model. [Download those here](https://mystic.the-eye.eu/public/AI/GPT-J-6B/step_383500.tar.zstd).
+
+Now that you have a bucket on the cloud and the weights on your PC, you need to upload the weights to the bucket in two steps:
+
+4. Decompress and extract `GPT-J-6B/step_383500.tar.zstd` so you're left with the uncompressed folder containing the sharded checkpoint.
+
+5. Open the Google Cloud SDK and run the following command, replacing the path names as appropriate: `gsutil -m cp -R LOCAL_PATH_TO/step_383500 gs://YOUR-BUCKET`. If that works, the console will show the files being uploaded. *Note: Took about 12 hours for me, uploading to the Netherlands from California; hopefully you'll have a better geographic situation than I did! I also initially made the mistake of uploading the still-packed .tar. Don't do that, TPU VMs don't have enough local storage for you to unpack it. To avoid needing to re-upload, I had to unpack it in Colab.*
+
+You'll want to upload tfrecords of your data as well, you can do that here or through the web interface, but trust me when I say you don't want to upload the nearly 70GB weights through the web interface.
+
+Note that steps 6 and 7, preparing the index and config files, can be done later on by editing the base repo in the VM's text editor. It's more efficient to instead make these changes to your own fork of the repo as follows:
+
+6. In the data folder, create a new file `foo.train.index`, replace foo with whatever you want to refer to your dataset as. For each tfrecord in your bucket that you intend to train with, add the path as a line in the index. Make `foo.val.index` and do the same for your validation dataset (if you have one). See the existing files for examples.
+
+7. Duplicate the config file `6B_roto_256.json`, rename it to something appropriate for your project. Open it up and make these edits:
+   - `tpu_size`: Change from `256` to `8`
+   - `bucket`: Change to your bucket
+   - `model_dir`: Change to the directory you'd like to save your checkpoints in
+   - `train_set` and `val_set`: Change to the index files from the last step
+   - `eval_harness_tasks`: Can be removed if you don't plan on using the eval harness
+   -  `val_every` & `ckpt_every` & `keep_every`: Usage should be intuitive. Don't set the `foo_every` values to 0 though or you'll get a divide by zero error. If you don't have a `val_set`, just set `val_every` to something higher than `total_steps`.
+   - `val_batches`: This should equal the number of sequences in your val dataset. You can find this number at the end of the .tfrecords file produced by `create_finetune_tfrecords.py`
+   - `name`: Change to a name for your model.
+   - `warmup_steps`, `lr`, `val_batches`, etc.: see the *Learning Rate Notes* section at the end of the guide.
+
+
+8. Push the changes to your GitHub repo.
+
+9. Follow [this guide](https://cloud.google.com/tpu/docs/jax-quickstart-tpu-vm) up to and including the step **"Connect to your Cloud TPU VM"**.
+
+Note that you need to use v2-alpha as the TPU software
+
+At this point you should have remote access to the TPU VM!
+
+10. In the new VM terminal, type `git clone https://github.com/kingoflolz/mesh-transformer-jax` (or, preferably, your own fork, after pushing the config and index files)
+
+NEW: Start a virtual environment!
+
+11. Move to the new directory with `cd mesh-transformer-jax` and run `pip install -r requirements.txt`. Since the requirements.txt file doesn't pin the exact jax version required for finetuning, run `pip install jax==0.2.12` and you'll be all set.
+NEW:
+```
+pip install "jax[tpu]>=0.2.16" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+export LD_LIBRARY_PATH=/usr/local/lib
+ldd /usr/local/lib/python3.8/dist-packages/torch/lib/libtorch.so
+```
+Install tensorflow with pip, dont install jax.
+
+12. Finally, run `python3 device_train.py --config=YOUR_CONFIG.json --tune-model-path=gs://YOUR-BUCKET/step_383500/`. If everything is set up correctly this will begin the fine-tuning process. First the model has to be loaded into memory; when `loading network` displayed on the console it took about 10-15 minutes before the next step, setting up WandB for logging. Option 3 allows you to skip that if you aren't using WandB. A step 1 checkpoint will save, and the real training will start. If you have a small dataset, this will go by quickly; TPU VMs can train at a rate of ~5000 tokens/second.
+
+13. You did it! Now don't forget any clean up steps you need to take like shutting down your TPU VM or removing unneeded data in buckets, so that you don't have any unexpected charges from Google later.
+
+## Now what?
+
+This guide is labeled "The Basics", anything we haven't covered so far is out of scope, but go check out the rest of the repository! Try `python3 device_sample.py --config=configs/YOUR_CONFIG.json` for a basic sampling interface. Use `slim_model.py` to prepare an easier-to-deploy slim version of your new weights for inference. Experiment!
+
+### Running with HuggingFace
+To use the model in HuggingFace's `transformer` library using pytorch, you'll need to transfer the weights
+into a format that it recognizes. This can be done using `to_hf_weights.py`. It's recommended that you use `slim_model.py` before attempting to move the weights to a pytorch/transformer format. Use `python to_hf_weights.py --help` to see usage details.
+
+*note: as of 9/1/2021, GPT-J has been merged into the `main` branch of `transformers` but has not yet been put into production. Run `pip install git+https://github.com/huggingface/transformers#transformers` to install the current `main` branch.
+
+## Learning Rate Notes
+
+**Thanks to nostalgebraist for talking about this!** They're the one who explained this part on Discord, I'm just paraphrasing really:
+
+The first thing you want to determine is how long a training epoch will be. `gradient_accumulation_steps` is your batch size, it defaults to `16`, nostalgebraist recommends `32`. Your .tfrecord files should have a number in the file name indicating how many sequences are in the dataset. Divide that number by the batch size and the result is how many steps are in an epoch. Now we can write the schedule.
+
+`lr` is recommended to be between `1e-5` and `5e-5`, with `end_lr` set to 1/5 or 1/10 of `lr`.
+`weight_decay` can remain `0.1`. `total_steps` should be at least one epoch, possibly longer if you have a validation
+set to determine your training loss with.
+`warmup_steps` should be 5-10% of total, and finally `anneal_steps` should be `total_steps - warmup_steps`.
+(The `lr` is set to `end_lr` after `warmup_steps+anneal_steps` and then keeps training until `total_steps`,
+but usually you should stop after annealing is done)
+
+To illustrate: I have a small dataset that tokenized into 1147 sequences as a .tfrecord. Dividing by `gradient_accumulation_steps` set to `16`, rounding up to ensure I use all the data, equals 72 steps per epoch. I'll set `lr` to `5e-5`, `end_lr` to a fifth of that, `1e-5`; that may be too much, it's on the high end of the recommended range. I'll set `total_steps` to `72` for one epoch, since I don't have a validation set. Then I'll set `anneal_steps` to `65` and `warmup_steps` to `7`. Simple as that, but you may need to fiddle with the specifics on your own.
